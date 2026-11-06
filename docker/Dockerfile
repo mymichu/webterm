@@ -85,16 +85,39 @@ WORKDIR /home/dev
 ENV EDITOR=nvim VISUAL=nvim STARSHIP_CONFIG=/etc/starship.toml
 ENTRYPOINT ["workspace-entrypoint"]
 
+# ---- tmux-dist: Debian's tmux client and its shared libraries ---------------
+# Taken from `base` so the sidecar's tmux matches the workspace's exactly.
+# glibc itself is left out: the distroless image ships the same trixie build.
+FROM base AS tmux-dist
+RUN set -eu; \
+    mkdir -p /out/usr/bin /out/etc; \
+    cp /usr/bin/tmux /out/usr/bin/; \
+    ldd /usr/bin/tmux | awk '/=> \// { print $3 }' \
+      | grep -vE '/(libc|libm|libresolv)\.so' \
+      | while read -r lib; do \
+          dir="/out$(dirname "$(readlink -f "$lib")")"; \
+          mkdir -p "$dir"; cp -L "$lib" "$dir/"; \
+        done; \
+    mkdir -p /out/usr/share/terminfo/x; \
+    cp -L "$(find /usr/lib/terminfo /usr/share/terminfo -name xterm-256color | head -n1)" /out/usr/share/terminfo/x/; \
+    mkdir -p /out/usr/lib/locale; \
+    cp -r /usr/lib/locale/C.utf8 /out/usr/lib/locale/; \
+    grep -E '^(root|nobody|dev):' /etc/passwd > /out/etc/passwd; \
+    grep -E '^(root|nogroup|dev):' /etc/group > /out/etc/group
+
 # ---- terminal: the sidecar serving the browser terminal ---------------------
-FROM base AS terminal
+# No shell or package manager: just term-server, the web files and the tmux
+# client. Each connection runs `tmux attach` against the workspace's server.
+FROM gcr.io/distroless/cc-debian13 AS terminal
+COPY --from=tmux-dist /out/ /
 COPY --from=build /out/term-server /usr/local/bin/term-server
 COPY --from=build /out/web /srv/web
-COPY --chmod=755 docker/terminal/attach-workspace.sh /usr/local/bin/attach-workspace
-USER dev
-WORKDIR /home/dev
-ENV BIND=0.0.0.0:8080 \
+USER 1000:1000
+ENV HOME=/ \
+    LANG=C.UTF-8 \
+    BIND=0.0.0.0:8080 \
     STATIC_DIR=/srv/web \
-    TERM_SHELL=/usr/local/bin/attach-workspace \
-    TERM_ARGS=""
+    TERM_SHELL=/usr/bin/tmux \
+    TERM_ARGS="-u -S /run/tmux/default attach-session -t main"
 EXPOSE 8080
-CMD ["term-server"]
+ENTRYPOINT ["/usr/local/bin/term-server"]

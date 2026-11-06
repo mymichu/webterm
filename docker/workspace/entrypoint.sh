@@ -10,6 +10,7 @@ tmux_() { tmux -u -S "$SOCKET" -f /etc/tmux/workspace.conf "$@"; }
 # The nvim config ships in the image; the home directory is a volume, so copy
 # it in on every start to pick up image updates (lazy-lock.json is kept).
 mkdir -p "$HOME/.config/nvim"
+rm -f "$HOME/.config/nvim/init.lua"
 cp /etc/workspace/nvim/init.lua "$HOME/.config/nvim/init.lua"
 
 # First start: install LazyVim's plugins so nvim is ready when first opened.
