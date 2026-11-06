@@ -1,0 +1,57 @@
+# Browser terminal for a containerized dev environment.
+#
+#   workspace  The dev environment: tmux server, fish, LazyVim, git. The tmux,
+#              nvim, fish and starship config ships in the image
+#              (docker/workspace/).
+#   terminal   Sidecar: shares the workspace's network namespace and tmux
+#              socket. It serves the WebAssembly terminal and attaches each
+#              browser tab to the workspace's tmux session.
+#
+#   just up   →   http://localhost:8080
+name: webterm
+
+services:
+  workspace:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: workspace
+    hostname: workspace
+    init: true
+    restart: unless-stopped
+    ports:
+      # Served by the terminal sidecar, which lives in this network namespace.
+      # Localhost only: a connection is a shell in the workspace.
+      - "127.0.0.1:${PORT:-8080}:8080"
+    volumes:
+      - home:/home/dev
+      - tmux-socket:/run/tmux
+      - ${WORKSPACE_DIR:-./workspace}:/home/dev/workspace
+    healthcheck:
+      test: ["CMD", "tmux", "-S", "/run/tmux/default", "has-session", "-t", "main"]
+      interval: 5s
+      # The first start installs LazyVim plugins before tmux comes up.
+      start_period: 15m
+
+  terminal:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: terminal
+    init: true
+    restart: unless-stopped
+    network_mode: service:workspace
+    volumes:
+      - tmux-socket:/run/tmux
+    environment:
+      # Set to require http://localhost:8080/?token=...
+      TERM_TOKEN: ${TERM_TOKEN:-}
+    depends_on:
+      workspace:
+        condition: service_healthy
+        restart: true
+
+volumes:
+  # Persists plugins, Mason tools, shell history and tmux-resurrect saves.
+  home:
+  tmux-socket:

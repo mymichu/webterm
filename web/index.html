@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>webterm</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,700;1,400;1,700&display=block">
+  <style>
+    /* Icons used by LazyVim, starship, Powerline etc.; the browser falls back to it per glyph. */
+    @font-face {
+      font-family: "Symbols Nerd Font Mono";
+      src: url("https://cdn.jsdelivr.net/gh/ryanoasis/nerd-fonts@v3.4.0/patched-fonts/NerdFontsSymbolsOnly/SymbolsNerdFontMono-Regular.ttf") format("truetype");
+      font-display: block;
+    }
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #282c34; }
+    #terminal { position: absolute; inset: 0; }
+    #error { color: #cc6666; font: 14px/1.5 monospace; padding: 16px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <div id="terminal"></div>
+  <script type="module">
+    import init, { start } from './pkg/web.js';
+
+    // Options via query string: ?fontSize=15&font=Fira+Code&token=...
+    const params = new URLSearchParams(location.search);
+    const font = params.get('font') || 'JetBrains Mono';
+    const fontSize = Number(params.get('fontSize')) || 14;
+    const family = `"${font}", "Symbols Nerd Font Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace`;
+
+    // Cell size is measured once at startup, so wait for the web font.
+    // Glyphs are rasterized once and cached, so fonts must be ready before the first frame.
+    const fontsReady = Promise.all([
+      ...['', 'bold ', 'italic ', 'bold italic '].map(s => document.fonts.load(`${s}${fontSize}px "${font}"`)),
+      document.fonts.load(`${fontSize}px "Symbols Nerd Font Mono"`, '\uf418'),
+    ]).catch(() => {});
+    await Promise.race([fontsReady, new Promise(r => setTimeout(r, 3000))]);
+
+    let url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
+    if (params.get('token')) url += `?token=${encodeURIComponent(params.get('token'))}`;
+
+    try {
+      await init();
+      const term = start(document.getElementById('terminal'), url, family, fontSize);
+      term.focus();
+      window.term = term;
+    } catch (err) {
+      document.body.innerHTML = `<div id="error">Failed to start terminal:\n${err}</div>`;
+      console.error(err);
+    }
+  </script>
+</body>
+</html>

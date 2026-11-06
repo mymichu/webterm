@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/protocol", "crates/term-core", "crates/web", "crates/server"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[profile.release.package.web]
+opt-level = "s"
