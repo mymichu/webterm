@@ -31,6 +31,9 @@ own tmux session, and every tab on the same workspace shares it. The first
 start installs the Neovim plugins, which takes about a minute
 (`docker compose logs -f go python`).
 
+**→ [Docker workspaces guide](docs/docker.md)**: getting started step by step,
+everyday commands, and scenarios like a single workspace or adding a Rust one.
+
 ### Native: your own shell
 
 Needs Rust with the `wasm32-unknown-unknown` target and a matching `wasm-bindgen` CLI.

@@ -83,17 +83,23 @@ ENV LANG=C.UTF-8 LC_ALL=C.UTF-8 WORKSPACE_BASE=${WORKSPACE_BASE}
 
 # LazyVim needs git, a C compiler + tree-sitter CLI (parsers), ripgrep/fd/fzf
 # (pickers), unzip/curl/node/python (Mason) and yarn (markdown-preview). The
-# buildpack-deps based images (golang, python, ...) already have most of it.
-RUN apt-get update \
- && apt-get install -y --no-install-recommends \
+# buildpack-deps based images (golang, python, ...) already have most of it;
+# Node and yarn come from Debian only when the base doesn't bring its own.
+RUN set -eux; \
+    node_pkgs="$(command -v node >/dev/null || echo nodejs npm)"; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
       tmux fish git curl ca-certificates build-essential unzip ripgrep fd-find fzf \
-      procps less openssh-client nodejs npm python3 python3-venv \
- && rm -rf /var/lib/apt/lists/* \
- && ln -sf /usr/bin/fdfind /usr/local/bin/fd \
- && npm install -g --no-fund --no-audit tree-sitter-cli yarn
+      procps less openssh-client python3 python3-venv $node_pkgs; \
+    rm -rf /var/lib/apt/lists/*; \
+    ln -sf /usr/bin/fdfind /usr/local/bin/fd; \
+    npm install -g --no-fund --no-audit tree-sitter-cli $(command -v yarn >/dev/null || echo yarn)
 
 # The home layout is created here, owned by dev, so a fresh volume starts out writable.
-RUN useradd --create-home --uid 1000 --shell /usr/bin/fish dev \
+# dev must be uid 1000 to match the sidecar; some bases (node) already use it.
+RUN existing="$(getent passwd 1000 | cut -d: -f1)" \
+ && if [ -n "$existing" ]; then userdel --remove "$existing"; fi \
+ && useradd --create-home --uid 1000 --shell /usr/bin/fish dev \
  && install -d -o dev -g dev /run/tmux \
  && mkdir -p /home/dev/.config/nvim /home/dev/.config/fish /home/dev/.local/share \
       /home/dev/.local/state /home/dev/.cache /home/dev/workspace \
