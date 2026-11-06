@@ -14,36 +14,206 @@
       src: url("https://cdn.jsdelivr.net/gh/ryanoasis/nerd-fonts@v3.4.0/patched-fonts/NerdFontsSymbolsOnly/SymbolsNerdFontMono-Regular.ttf") format("truetype");
       font-display: block;
     }
-    html, body { margin: 0; height: 100%; overflow: hidden; background: #282c34; }
+    :root {
+      --bg: #282c34;
+      --chrome: #21252b;
+      --line: #181a1f;
+      --hover: #2c313a;
+      --text: #abb2bf;
+      --muted: #7f848e;
+      --accent: #61afef;
+      --ok: #98c379;
+      --header: 34px;
+      --ui: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); }
     #terminal { position: absolute; inset: 0; }
+    /* The header and side panel only exist with more than one workspace. */
+    body:not(.multi) :is(#bar, #panel, #backdrop) { display: none; }
+    body.multi #terminal { inset: var(--header) 0 0 0; }
     #error { color: #cc6666; font: 14px/1.5 monospace; padding: 16px; white-space: pre-wrap; }
+
+    /* ---- header ---------------------------------------------------------- */
+    #bar {
+      position: absolute; inset: 0 0 auto 0; height: var(--header);
+      display: flex; align-items: center; gap: 8px; padding: 0 8px;
+      background: var(--chrome); border-bottom: 1px solid var(--line);
+      font: var(--ui); color: var(--text); box-sizing: border-box;
+    }
+    #ws-toggle {
+      display: flex; align-items: center; gap: 8px; min-width: 0;
+      height: 26px; padding: 0 10px 0 8px; border: 0; border-radius: 6px;
+      background: transparent; color: inherit; font: inherit; cursor: pointer;
+    }
+    #ws-toggle:hover, #ws-toggle[aria-expanded="true"] { background: var(--hover); }
+    #ws-toggle:focus-visible, .ws-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+    #ws-toggle svg { flex: none; color: var(--muted); }
+    #ws-name { font-weight: 600; white-space: nowrap; }
+    #ws-desc { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .dot { flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--ok); }
+    .dot.stopped { background: none; box-shadow: inset 0 0 0 1.5px var(--muted); }
+
+    /* ---- side panel ------------------------------------------------------ */
+    #backdrop {
+      position: absolute; inset: var(--header) 0 0 0; z-index: 1; background: rgb(0 0 0 / .35);
+      opacity: 0; pointer-events: none; transition: opacity .15s;
+    }
+    #panel {
+      position: absolute; top: var(--header); bottom: 0; left: 0; z-index: 2;
+      width: min(300px, 85vw); box-sizing: border-box; padding: 12px 8px;
+      background: var(--chrome); border-right: 1px solid var(--line);
+      font: var(--ui); color: var(--text); overflow-y: auto;
+      transform: translateX(-100%); visibility: hidden;
+      transition: transform .18s ease, visibility 0s .18s;
+    }
+    body.panel-open #panel { transform: none; visibility: visible; transition: transform .18s ease; }
+    body.panel-open #backdrop { opacity: 1; pointer-events: auto; }
+    #panel h2 {
+      margin: 0 8px 8px; font-size: 11px; font-weight: 600; letter-spacing: .06em;
+      text-transform: uppercase; color: var(--muted);
+    }
+    .ws-item {
+      display: flex; align-items: center; gap: 10px; padding: 8px; border-radius: 6px;
+      color: inherit; text-decoration: none;
+    }
+    .ws-item:hover { background: var(--hover); }
+    .ws-item[aria-current="page"] { background: var(--hover); box-shadow: inset 2px 0 var(--accent); }
+    .ws-item span { display: block; min-width: 0; }
+    .ws-item .name { font-weight: 600; }
+    .ws-item .desc { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    @media (prefers-reduced-motion: reduce) { #panel, #backdrop { transition: none !important; } }
   </style>
 </head>
 <body>
+  <header id="bar">
+    <button id="ws-toggle" aria-expanded="false" aria-controls="panel" title="Switch workspace">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+        <rect x="1.75" y="2.75" width="12.5" height="10.5" rx="1.5"/><path d="M4.5 6.5 6.5 8l-2 1.5M8 10h3"/>
+      </svg>
+      <span id="ws-name"></span>
+      <span id="ws-desc"></span>
+      <svg class="chevron" width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+        <path d="m3 4.5 3 3 3-3"/>
+      </svg>
+    </button>
+  </header>
+  <div id="backdrop"></div>
+  <aside id="panel" aria-label="Workspaces">
+    <h2>Workspaces</h2>
+    <nav id="ws-list"></nav>
+  </aside>
   <div id="terminal"></div>
   <script type="module">
     import init, { start } from './pkg/web.js';
 
-    // Options via query string: ?fontSize=15&font=Fira+Code&token=...
+    // Options via query string: ?workspace=go&fontSize=15&font=Fira+Code&token=...
     const params = new URLSearchParams(location.search);
+    const token = params.get('token');
     const font = params.get('font') || 'JetBrains Mono';
     const fontSize = Number(params.get('fontSize')) || 14;
     const family = `"${font}", "Symbols Nerd Font Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace`;
 
+    // ---- workspaces: header + side panel ---------------------------------
+    const $ = id => document.getElementById(id);
+    const toggle = $('ws-toggle');
+
+    async function fetchWorkspaces() {
+      try {
+        const res = await fetch(`/api/workspaces${token ? `?token=${encodeURIComponent(token)}` : ''}`);
+        return res.ok ? await res.json() : null;
+      } catch { return null; }
+    }
+
+    // Switching reloads the page with ?workspace=<name>, so each workspace has
+    // its own URL (bookmarks, middle-click opens it in a new tab).
+    function workspaceHref(name) {
+      const next = new URLSearchParams(location.search);
+      next.set('workspace', name);
+      return `?${next}`;
+    }
+
+    function statusDot(ws) {
+      const dot = document.createElement('span');
+      dot.className = ws.running ? 'dot' : 'dot stopped';
+      dot.title = ws.running ? 'running' : 'stopped';
+      return dot;
+    }
+
+    function renderList(list, current) {
+      const nav = $('ws-list');
+      nav.replaceChildren();
+      for (const ws of list.workspaces) {
+        const a = document.createElement('a');
+        a.className = 'ws-item';
+        a.href = workspaceHref(ws.name);
+        if (ws.name === current) a.setAttribute('aria-current', 'page');
+        const text = document.createElement('span');
+        const name = document.createElement('span');
+        name.className = 'name';
+        name.textContent = ws.name;
+        const desc = document.createElement('span');
+        desc.className = 'desc';
+        desc.textContent = [ws.description, ws.running ? '' : 'stopped'].filter(Boolean).join(' · ');
+        text.append(name, desc);
+        a.append(statusDot(ws), text);
+        nav.append(a);
+      }
+    }
+
+    let current = null;
+    function setPanel(open) {
+      document.body.classList.toggle('panel-open', open);
+      toggle.setAttribute('aria-expanded', open);
+      const focusCurrent = () => $('ws-list').querySelector('[aria-current], a')?.focus();
+      if (open) {
+        focusCurrent();
+        // Containers come and go; refresh the list each time it opens.
+        fetchWorkspaces().then(list => {
+          if (!list || !document.body.classList.contains('panel-open')) return;
+          renderList(list, current);
+          focusCurrent();
+        });
+      } else {
+        window.term?.focus();
+      }
+    }
+    toggle.addEventListener('click', () => setPanel(!document.body.classList.contains('panel-open')));
+    $('backdrop').addEventListener('click', () => setPanel(false));
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Escape' && document.body.classList.contains('panel-open')) setPanel(false);
+    });
+
+    // With a single workspace there is nothing to choose: the page is just the
+    // terminal, and the server opens that workspace.
+    const list = await fetchWorkspaces();
+    if (list?.workspaces.length > 1) {
+      const ws = list.workspaces.find(w => w.name === params.get('workspace')) ?? list.workspaces[0];
+      current = ws.name;
+      $('ws-name').textContent = ws.name;
+      $('ws-desc').textContent = ws.description;
+      toggle.prepend(statusDot(ws));
+      document.title = `${ws.name} · webterm`;
+      renderList(list, current);
+      document.body.classList.add('multi');
+    }
+
+    // ---- terminal ---------------------------------------------------------
     // Cell size is measured once at startup, so wait for the web font.
     // Glyphs are rasterized once and cached, so fonts must be ready before the first frame.
     const fontsReady = Promise.all([
       ...['', 'bold ', 'italic ', 'bold italic '].map(s => document.fonts.load(`${s}${fontSize}px "${font}"`)),
-      document.fonts.load(`${fontSize}px "Symbols Nerd Font Mono"`, '\uf418'),
+      document.fonts.load(`${fontSize}px "Symbols Nerd Font Mono"`, ''),
     ]).catch(() => {});
     await Promise.race([fontsReady, new Promise(r => setTimeout(r, 3000))]);
 
-    let url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
-    if (params.get('token')) url += `?token=${encodeURIComponent(params.get('token'))}`;
+    const wsParams = new URLSearchParams();
+    if (token) wsParams.set('token', token);
+    if (current) wsParams.set('workspace', current);
+    const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws${wsParams.size ? `?${wsParams}` : ''}`;
 
     try {
       await init();
-      const term = start(document.getElementById('terminal'), url, family, fontSize);
+      const term = start($('terminal'), url, family, fontSize);
       term.focus();
       window.term = term;
     } catch (err) {

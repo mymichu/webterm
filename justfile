@@ -30,10 +30,10 @@ run: build
 test:
     cargo test --workspace
 
-# Start the dockerized workspace + terminal sidecar on http://localhost:8080
+# Start the dockerized workspaces + terminal sidecar on http://localhost:8080
 up:
-    docker compose up -d --build
-    @echo "http://localhost:${PORT:-8080}  (first start installs LazyVim plugins: docker compose logs -f workspace)"
+    docker compose up -d --build --remove-orphans
+    @echo "http://localhost:${PORT:-8080}  (first start installs LazyVim plugins: docker compose logs -f go python)"
 
 # Stop the containers (volumes with plugins and history are kept)
 down:

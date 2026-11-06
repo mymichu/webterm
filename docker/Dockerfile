@@ -1,8 +1,16 @@
 # syntax=docker/dockerfile:1.7
 #
-# Three images from one file, so the tmux client in the terminal sidecar and
-# the tmux server in the workspace are the exact same version (the tmux
+# Images built from this file:
+#   workspace  a dev environment: any Debian trixie base image (golang, python,
+#              ...) plus the shared devtools layer (tmux, fish, LazyVim, ...)
+#   terminal   the sidecar serving the browser terminal (distroless)
+#
+# Every image takes tmux from Debian trixie, so the sidecar's tmux client and
+# each workspace's tmux server are the exact same version (the tmux
 # client/server protocol is not stable across versions).
+
+# Base image of a workspace; compose builds one workspace per base.
+ARG WORKSPACE_BASE=buildpack-deps:trixie
 
 # ---- build: Rust backend + WebAssembly front end ---------------------------
 FROM rust:1-trixie AS build
@@ -22,35 +30,28 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
  && wasm-bindgen --target web --no-typescript --out-dir /out/web/pkg \
       target/wasm32-unknown-unknown/release/web.wasm
 
-# ---- base: shared by workspace and sidecar ---------------------------------
+# ---- base: Debian's tmux, for the sidecar ----------------------------------
 FROM debian:trixie-slim AS base
 # tmux replaces non-ASCII characters with '_' unless the locale is UTF-8.
 ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
 RUN apt-get update \
  && apt-get install -y --no-install-recommends tmux ca-certificates \
  && rm -rf /var/lib/apt/lists/*
-# Both containers run as the same uid: the tmux server only accepts clients
+# All containers run as the same uid: a tmux server only accepts clients
 # running as its own user.
-RUN useradd --create-home --uid 1000 --shell /bin/bash dev \
- && install -d -o dev -g dev /run/tmux
+RUN useradd --create-home --uid 1000 --shell /bin/bash dev
 
-# ---- workspace: the dev environment ----------------------------------------
-FROM base AS workspace
+# ---- devtools: the editor setup shared by every workspace -------------------
+# Self-contained under /opt/devtools and independent of the workspace base, so
+# `COPY --link` adds it to each workspace as the same, shared layer.
+FROM debian:trixie-slim AS devtools
 ARG TARGETARCH
 ARG NVIM_VERSION=v0.11.5
 ARG LAZYGIT_VERSION=0.55.1
 ARG STARSHIP_VERSION=v1.23.0
-
-# LazyVim needs git, a C compiler + tree-sitter CLI (parsers), ripgrep/fd/fzf
-# (pickers), unzip/curl/node/python (Mason), lazygit and yarn (markdown-preview).
 RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-      git fish curl build-essential unzip ripgrep fd-find fzf procps less \
-      openssh-client nodejs npm python3 python3-venv \
- && rm -rf /var/lib/apt/lists/* \
- && ln -s /usr/bin/fdfind /usr/local/bin/fd \
- && npm install -g --no-fund --no-audit tree-sitter-cli yarn
-
+ && apt-get install -y --no-install-recommends curl ca-certificates git \
+ && rm -rf /var/lib/apt/lists/*
 # Debian's neovim is too old for LazyVim (needs >= 0.11.2).
 RUN set -eux; \
     case "$TARGETARCH" in \
@@ -58,31 +59,54 @@ RUN set -eux; \
       arm64) arch=arm64;  triple=aarch64 ;; \
       *) echo "unsupported architecture: $TARGETARCH" >&2; exit 1 ;; \
     esac; \
-    curl -fsSL "https://github.com/neovim/neovim/releases/download/${NVIM_VERSION}/nvim-linux-${arch}.tar.gz" | tar -xz -C /opt; \
-    ln -s "/opt/nvim-linux-${arch}/bin/nvim" /usr/local/bin/nvim; \
+    mkdir -p /opt/devtools/bin; \
+    curl -fsSL "https://github.com/neovim/neovim/releases/download/${NVIM_VERSION}/nvim-linux-${arch}.tar.gz" \
+      | tar -xz -C /opt/devtools; \
+    ln -s "../nvim-linux-${arch}/bin/nvim" /opt/devtools/bin/nvim; \
     curl -fsSL "https://github.com/jesseduffield/lazygit/releases/download/v${LAZYGIT_VERSION}/lazygit_${LAZYGIT_VERSION}_Linux_${arch}.tar.gz" \
-      | tar -xz -C /usr/local/bin lazygit; \
+      | tar -xz -C /opt/devtools/bin lazygit; \
     curl -fsSL "https://github.com/starship/starship/releases/download/${STARSHIP_VERSION}/starship-${triple}-unknown-linux-musl.tar.gz" \
-      | tar -xz -C /usr/local/bin starship
-
+      | tar -xz -C /opt/devtools/bin starship
 # tmux session persistence, loaded at the end of tmux.conf.
-RUN git clone --depth 1 https://github.com/tmux-plugins/tmux-resurrect /usr/share/tmux-plugins/tmux-resurrect \
- && git clone --depth 1 https://github.com/tmux-plugins/tmux-continuum /usr/share/tmux-plugins/tmux-continuum
+RUN git clone --depth 1 https://github.com/tmux-plugins/tmux-resurrect /opt/devtools/tmux-plugins/tmux-resurrect \
+ && git clone --depth 1 https://github.com/tmux-plugins/tmux-continuum /opt/devtools/tmux-plugins/tmux-continuum
+COPY docker/workspace/tmux.conf docker/workspace/starship.toml /opt/devtools/etc/
+COPY docker/workspace/config.fish /opt/devtools/etc/fish/workspace.fish
+COPY docker/workspace/nvim/init.lua /opt/devtools/etc/nvim/init.lua
+COPY --chmod=755 docker/workspace/entrypoint.sh /opt/devtools/bin/workspace-entrypoint
 
-COPY docker/workspace/tmux.conf /etc/tmux/workspace.conf
-COPY docker/workspace/config.fish /etc/fish/conf.d/workspace.fish
-COPY docker/workspace/starship.toml /etc/starship.toml
-COPY docker/workspace/nvim/init.lua /etc/workspace/nvim/init.lua
-COPY --chmod=755 docker/workspace/entrypoint.sh /usr/local/bin/workspace-entrypoint
+# ---- workspace: a dev environment on any Debian trixie base -----------------
+FROM ${WORKSPACE_BASE} AS workspace
+ARG WORKSPACE_BASE
+# tmux replaces non-ASCII characters with '_' unless the locale is UTF-8.
+ENV LANG=C.UTF-8 LC_ALL=C.UTF-8 WORKSPACE_BASE=${WORKSPACE_BASE}
 
-# Pre-create the home layout owned by dev, so the volume starts out writable.
-RUN usermod --shell /usr/bin/fish dev \
- && mkdir -p /home/dev/.config/nvim /home/dev/.local/share \
+# LazyVim needs git, a C compiler + tree-sitter CLI (parsers), ripgrep/fd/fzf
+# (pickers), unzip/curl/node/python (Mason) and yarn (markdown-preview). The
+# buildpack-deps based images (golang, python, ...) already have most of it.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      tmux fish git curl ca-certificates build-essential unzip ripgrep fd-find fzf \
+      procps less openssh-client nodejs npm python3 python3-venv \
+ && rm -rf /var/lib/apt/lists/* \
+ && ln -sf /usr/bin/fdfind /usr/local/bin/fd \
+ && npm install -g --no-fund --no-audit tree-sitter-cli yarn
+
+# The home layout is created here, owned by dev, so a fresh volume starts out writable.
+RUN useradd --create-home --uid 1000 --shell /usr/bin/fish dev \
+ && install -d -o dev -g dev /run/tmux \
+ && mkdir -p /home/dev/.config/nvim /home/dev/.config/fish /home/dev/.local/share \
       /home/dev/.local/state /home/dev/.cache /home/dev/workspace \
  && chown -R dev:dev /home/dev
+
+COPY --link --from=devtools /opt/devtools /opt/devtools
+RUN ln -s /opt/devtools/etc/fish/workspace.fish /etc/fish/conf.d/workspace.fish
+
 USER dev
 WORKDIR /home/dev
-ENV EDITOR=nvim VISUAL=nvim STARSHIP_CONFIG=/etc/starship.toml
+ENV PATH=/opt/devtools/bin:$PATH \
+    EDITOR=nvim VISUAL=nvim \
+    STARSHIP_CONFIG=/opt/devtools/etc/starship.toml
 ENTRYPOINT ["workspace-entrypoint"]
 
 # ---- tmux-dist: Debian's tmux client and its shared libraries ---------------
@@ -91,6 +115,7 @@ ENTRYPOINT ["workspace-entrypoint"]
 FROM base AS tmux-dist
 RUN set -eu; \
     mkdir -p /out/usr/bin /out/etc; \
+    install -d -o dev -g dev /out/run/tmux; \
     cp /usr/bin/tmux /out/usr/bin/; \
     ldd /usr/bin/tmux | awk '/=> \// { print $3 }' \
       | grep -vE '/(libc|libm|libresolv)\.so' \
@@ -107,17 +132,18 @@ RUN set -eu; \
 
 # ---- terminal: the sidecar serving the browser terminal ---------------------
 # No shell or package manager: just term-server, the web files and the tmux
-# client. Each connection runs `tmux attach` against the workspace's server.
+# client. Each connection runs `tmux attach` against the chosen workspace, as
+# configured in docker/webterm.yaml.
 FROM gcr.io/distroless/cc-debian13 AS terminal
 COPY --from=tmux-dist /out/ /
 COPY --from=build /out/term-server /usr/local/bin/term-server
 COPY --from=build /out/web /srv/web
+COPY docker/webterm.yaml /etc/webterm/webterm.yaml
 USER 1000:1000
 ENV HOME=/ \
     LANG=C.UTF-8 \
     BIND=0.0.0.0:8080 \
     STATIC_DIR=/srv/web \
-    TERM_SHELL=/usr/bin/tmux \
-    TERM_ARGS="-u -S /run/tmux/default attach-session -t main"
+    TERM_CONFIG=/etc/webterm/webterm.yaml
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/term-server"]

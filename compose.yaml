@@ -1,37 +1,61 @@
-# Browser terminal for a containerized dev environment.
+# Browser terminal for containerized dev environments.
 #
-#   workspace  The dev environment: tmux server, fish, LazyVim, git. The tmux,
-#              nvim, fish and starship config ships in the image
-#              (docker/workspace/).
-#   terminal   Sidecar: shares the workspace's network namespace and tmux
-#              socket. It serves the WebAssembly terminal and attaches each
-#              browser tab to the workspace's tmux session.
+#   go, python  Workspaces: a language base image plus the shared devtools
+#               layer (tmux, fish, LazyVim, git, ...; see docker/Dockerfile).
+#               Each runs its own tmux server on /run/tmux/<name>.
+#   terminal    Sidecar: serves the WebAssembly terminal and attaches each
+#               browser tab to a workspace's tmux session through the shared
+#               socket volume. docker/webterm.yaml lists the workspaces; with
+#               more than one, the header in the page switches between them.
 #
 #   just up   →   http://localhost:8080
+#
+# To add a workspace, copy a service below and change its name, WORKSPACE_BASE
+# (any Debian trixie image, e.g. rust:1-trixie or node:24-trixie) and volume,
+# then add it to docker/webterm.yaml.
 name: webterm
 
+x-workspace: &workspace
+  init: true
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD-SHELL", "tmux -S /run/tmux/$$WORKSPACE_NAME has-session -t main"]
+    interval: 5s
+    # The first start installs LazyVim plugins before tmux comes up.
+    start_period: 15m
+
 services:
-  workspace:
+  go:
+    <<: *workspace
     build:
       context: .
       dockerfile: docker/Dockerfile
       target: workspace
-    hostname: workspace
-    init: true
-    restart: unless-stopped
-    ports:
-      # Served by the terminal sidecar, which lives in this network namespace.
-      # Localhost only: a connection is a shell in the workspace.
-      - "127.0.0.1:${PORT:-8080}:8080"
+      args:
+        WORKSPACE_BASE: golang:1-trixie
+    hostname: go
+    environment:
+      WORKSPACE_NAME: go
     volumes:
-      - home:/home/dev
+      - home-go:/home/dev
       - tmux-socket:/run/tmux
       - ${WORKSPACE_DIR:-./workspace}:/home/dev/workspace
-    healthcheck:
-      test: ["CMD", "tmux", "-S", "/run/tmux/default", "has-session", "-t", "main"]
-      interval: 5s
-      # The first start installs LazyVim plugins before tmux comes up.
-      start_period: 15m
+
+  python:
+    <<: *workspace
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: workspace
+      args:
+        WORKSPACE_BASE: python:3-trixie
+    hostname: python
+    environment:
+      WORKSPACE_NAME: python
+    volumes:
+      - home-python:/home/dev
+      - tmux-socket:/run/tmux
+      - ${WORKSPACE_DIR:-./workspace}:/home/dev/workspace
 
   terminal:
     build:
@@ -40,18 +64,19 @@ services:
       target: terminal
     init: true
     restart: unless-stopped
-    network_mode: service:workspace
+    ports:
+      # Localhost only: a connection is a shell in a workspace.
+      - "127.0.0.1:${PORT:-8080}:8080"
     volumes:
       - tmux-socket:/run/tmux
+      - ./docker/webterm.yaml:/etc/webterm/webterm.yaml:ro
     environment:
       # Set to require http://localhost:8080/?token=...
       TERM_TOKEN: ${TERM_TOKEN:-}
-    depends_on:
-      workspace:
-        condition: service_healthy
-        restart: true
 
 volumes:
-  # Persists plugins, Mason tools, shell history and tmux-resurrect saves.
-  home:
+  # One home per workspace: plugins, Mason tools, shell history and
+  # tmux-resurrect saves persist across restarts.
+  home-go:
+  home-python:
   tmux-socket:

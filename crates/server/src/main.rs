@@ -4,6 +4,12 @@
 //! WebSocket connection gets its own shell running in a pseudo-terminal.
 //! Keystrokes from the browser are written to the PTY, PTY output is streamed
 //! back, and resize events are applied to the PTY window size.
+//!
+//! What a connection runs comes from the configured workspaces (see
+//! [`config`]): `/api/workspaces` lists them and `/ws?workspace=<name>` picks
+//! one, defaulting to the first.
+
+mod config;
 
 use std::io::{Read, Write};
 use std::net::SocketAddr;
@@ -15,10 +21,12 @@ use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::Router;
+use axum::{Json, Router};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use protocol::{ClientMsg, ServerMsg};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+use crate::config::Workspace;
 use tokio::sync::mpsc;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
@@ -30,8 +38,7 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 const MAX_FRAME: usize = 256 * 1024;
 
 struct Config {
-    shell: String,
-    shell_args: Vec<String>,
+    workspaces: Vec<Workspace>,
     token: Option<String>,
     allowed_origins: Vec<String>,
 }
@@ -39,6 +46,19 @@ struct Config {
 #[derive(Deserialize)]
 struct WsQuery {
     token: Option<String>,
+    workspace: Option<String>,
+}
+
+#[derive(Serialize)]
+struct WorkspaceList {
+    workspaces: Vec<WorkspaceInfo>,
+}
+
+#[derive(Serialize)]
+struct WorkspaceInfo {
+    name: String,
+    description: String,
+    running: bool,
 }
 
 #[tokio::main]
@@ -50,8 +70,7 @@ async fn main() -> Result<(), Error> {
     let addr: SocketAddr = env_or("BIND", "127.0.0.1:8080").parse()?;
     let static_dir = PathBuf::from(env_or("STATIC_DIR", concat!(env!("CARGO_MANIFEST_DIR"), "/../../web")));
     let config = Arc::new(Config {
-        shell: env_or("TERM_SHELL", &std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())),
-        shell_args: env_or("TERM_ARGS", "-l").split_whitespace().map(String::from).collect(),
+        workspaces: config::load()?,
         token: std::env::var("TERM_TOKEN").ok().filter(|t| !t.is_empty()),
         allowed_origins: std::env::var("ALLOWED_ORIGINS")
             .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
@@ -64,11 +83,13 @@ async fn main() -> Result<(), Error> {
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
+        .route("/api/workspaces", get(workspaces_handler))
         .fallback_service(ServeDir::new(&static_dir))
         .layer(TraceLayer::new_for_http())
         .with_state(config.clone());
 
-    info!("serving {} on http://{addr} (shell: {})", static_dir.display(), config.shell);
+    let names: Vec<&str> = config.workspaces.iter().map(|w| w.name.as_str()).collect();
+    info!("serving {} on http://{addr} (workspaces: {})", static_dir.display(), names.join(", "));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
@@ -85,16 +106,47 @@ async fn ws_handler(ws: WebSocketUpgrade, headers: HeaderMap, Query(query): Quer
         warn!("rejected WebSocket from origin {:?}", headers.get(header::ORIGIN));
         return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
     }
-    if let Some(expected) = &config.token
-        && query.token.as_deref() != Some(expected.as_str())
-    {
+    if !token_ok(&config, query.token.as_deref()) {
         return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
     }
+    let workspace = match &query.workspace {
+        Some(name) => config.workspaces.iter().find(|w| w.name == *name),
+        None => config.workspaces.first(),
+    };
+    let Some(workspace) = workspace else {
+        return (StatusCode::NOT_FOUND, "no such workspace").into_response();
+    };
+    let (program, args) = workspace.command();
     ws.on_upgrade(move |socket| async move {
-        if let Err(err) = run_session(socket, &config).await {
+        if let Err(err) = run_session(socket, &program, &args).await {
             warn!("session ended with error: {err}");
         }
     })
+}
+
+async fn workspaces_handler(Query(query): Query<WsQuery>, State(config): State<Arc<Config>>) -> Response {
+    if !token_ok(&config, query.token.as_deref()) {
+        return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
+    }
+    let config = config.clone();
+    // Checking tmux sockets is blocking I/O.
+    let list = tokio::task::spawn_blocking(move || {
+        let workspaces = config
+            .workspaces
+            .iter()
+            .map(|w| WorkspaceInfo { name: w.name.clone(), description: w.description.clone(), running: w.running() })
+            .collect();
+        WorkspaceList { workspaces }
+    })
+    .await;
+    match list {
+        Ok(list) => Json(list).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+fn token_ok(config: &Config, token: Option<&str>) -> bool {
+    config.token.as_deref().is_none_or(|expected| token == Some(expected))
 }
 
 /// Accepts same-origin requests, requests without an Origin header (non-browser
@@ -110,11 +162,11 @@ fn origin_allowed(headers: &HeaderMap, allowed: &[String]) -> bool {
     headers.get(header::HOST).and_then(|v| v.to_str().ok()) == Some(origin_host)
 }
 
-async fn run_session(mut socket: WebSocket, config: &Config) -> Result<(), Error> {
+async fn run_session(mut socket: WebSocket, program: &str, args: &[String]) -> Result<(), Error> {
     let pair = native_pty_system().openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })?;
 
-    let mut cmd = CommandBuilder::new(&config.shell);
-    cmd.args(&config.shell_args);
+    let mut cmd = CommandBuilder::new(program);
+    cmd.args(args);
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     cmd.env("TERM_PROGRAM", "webterm");
@@ -124,7 +176,7 @@ async fn run_session(mut socket: WebSocket, config: &Config) -> Result<(), Error
     let mut child = pair.slave.spawn_command(cmd)?;
     let mut killer = child.clone_killer();
     drop(pair.slave);
-    info!("spawned {} (pid {:?})", config.shell, child.process_id());
+    info!("spawned {program} {} (pid {:?})", args.join(" "), child.process_id());
 
     let master = pair.master;
     let mut reader = master.try_clone_reader()?;

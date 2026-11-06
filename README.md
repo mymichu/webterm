@@ -10,7 +10,7 @@ Run your shell, or a full tmux dev container, in a browser tab.
 - **Fast**: WebGL2 renderer with a glyph atlas, one draw call per frame
 - **Correct**: xterm-compatible VT core, truecolor, mouse reporting, bracketed paste, OSC 52
 - **Crisp**: box drawing, block elements and Powerline glyphs are drawn procedurally, with no seams
-- **Batteries included**: a Docker workspace with tmux, fish, starship and LazyVim, one command away
+- **Batteries included**: Docker workspaces (Go, Python, ...) sharing one tmux + LazyVim setup, switchable from the header
 
 ## Quick start
 
@@ -23,8 +23,13 @@ just up      # build and start → http://localhost:8080
 just down    # stop (plugins, history and tmux sessions are kept)
 ```
 
-Every browser tab attaches to the same tmux session. The first start installs
-the Neovim plugins, which takes about a minute (`docker compose logs -f workspace`).
+This starts a `go` and a `python` workspace, as listed in
+[`docker/webterm.yaml`](docker/webterm.yaml). The header shows the workspace
+you're in; click it to open the side panel and switch. With only one workspace
+configured, the page is just the terminal. Each workspace keeps its
+own tmux session, and every tab on the same workspace shares it. The first
+start installs the Neovim plugins, which takes about a minute
+(`docker compose logs -f go python`).
 
 ### Native: your own shell
 
@@ -68,20 +73,36 @@ between a WebSocket and a PTY, with one shell per connection.
 
 ### The Docker setup
 
-`compose.yaml` runs two containers built from [`docker/Dockerfile`](docker/Dockerfile):
+```
+ browser ──ws──▶ terminal (sidecar)  ── tmux attach ──▶  /run/tmux/go      ◀── go workspace
+                 term-server + tmux client               /run/tmux/python  ◀── python workspace
+```
 
-- **workspace**: the dev environment (Debian trixie, tmux, fish + starship,
-  Neovim + LazyVim, git, lazygit, ripgrep/fd/fzf, node, python). It runs the
-  tmux server. Your code lives in `./workspace` (override with `WORKSPACE_DIR`),
-  and the home directory is a volume, so plugins, history and tmux-resurrect
-  saves persist.
-- **terminal**: a sidecar that runs `term-server`. It shares the workspace's
-  network namespace and tmux socket, and each browser tab runs `tmux attach`.
-  Every process runs in the workspace. No sshd, Docker socket or extra
-  privileges are involved.
+`compose.yaml` runs these containers, all built from [`docker/Dockerfile`](docker/Dockerfile):
+
+- **Workspaces** (`go`, `python`): a language base image (`golang:1-trixie`,
+  `python:3-trixie`) plus the shared **devtools** layer: Neovim + LazyVim,
+  lazygit, starship, the tmux plugins and their config, all under
+  `/opt/devtools`. The devtools layer doesn't depend on the base, so BuildKit
+  adds it to every workspace as the same layer (`COPY --link`). Each workspace
+  runs its own tmux server on `/run/tmux/<name>` and has its own home volume.
+  Your code lives in `./workspace`, shared by all of them (override with
+  `WORKSPACE_DIR`). LazyVim turns on the Go/Python/Rust extras when that
+  toolchain is installed.
+- **terminal**: a sidecar that runs `term-server` with the workspaces from
+  `docker/webterm.yaml`. Each browser tab runs `tmux attach` against the chosen one,
+  so every process runs in the workspace. The image is distroless (~15 MB
+  download). No sshd, Docker socket or extra privileges are involved.
 
 The tmux (prefix `C-b`), LazyVim, fish and starship config lives in
 [`docker/workspace/`](docker/workspace). Edit it there and rerun `just up`.
+
+**Adding a workspace:** copy the `python` service in `compose.yaml`, then change
+its name, `WORKSPACE_BASE` and home volume, and add an entry to
+`docker/webterm.yaml`. Any Debian trixie based image works,
+e.g. `rust:1-trixie` or `node:24-trixie`. It has to be trixie because tmux comes
+from Debian, and the sidecar's tmux client must match each workspace's tmux
+server version.
 
 ## Configuration
 
@@ -90,15 +111,35 @@ The tmux (prefix `C-b`), LazyVim, fish and starship config lives in
 | variable | default | meaning |
 |---|---|---|
 | `BIND` | `127.0.0.1:8080` | listen address |
-| `TERM_SHELL` | `$SHELL` | program to run for each connection |
+| `TERM_CONFIG` | unset | workspace config file (see below) |
+| `TERM_SHELL` | `$SHELL` | without `TERM_CONFIG`: program to run for each connection |
 | `TERM_ARGS` | `-l` | its arguments (whitespace-separated) |
 | `TERM_TOKEN` | unset | if set, connections need `?token=...` |
 | `ALLOWED_ORIGINS` | unset | extra comma-separated origins allowed to connect |
 | `STATIC_DIR` | `web/` | front-end directory |
 
+**Workspaces** (`TERM_CONFIG`, YAML): what a browser tab can attach to, in the
+order the side panel lists them. The first one opens when the URL doesn't name
+one (`?workspace=<name>`). With a single workspace there's no header or panel,
+just the terminal.
+
+```yaml
+workspaces:
+  - name: go
+    description: Go · golang:1-trixie   # optional, shown in the header
+    tmux_socket: /run/tmux/go           # attach to the tmux server on this socket
+    # tmux_session: main                # default
+
+  - name: shell
+    command: [fish, -l]                 # or run any command
+```
+
+Without `TERM_CONFIG` there's one workspace running `TERM_SHELL` `TERM_ARGS`.
+`GET /api/workspaces` lists the workspaces and whether each tmux server is up.
+
 Docker also reads `PORT` (default `8080`), `WORKSPACE_DIR` and `TERM_TOKEN`.
 
-**Front end** (query string): `http://localhost:8080/?fontSize=15&font=Fira+Code&token=...`
+**Front end** (query string): `http://localhost:8080/?workspace=python&fontSize=15&font=Fira+Code&token=...`
 
 > [!WARNING]
 > A connection is a shell running as the server's user. By default the server
@@ -115,6 +156,7 @@ Docker also reads `PORT` (default `8080`), `WORKSPACE_DIR` and `TERM_TOKEN`.
 | Scroll back | mouse wheel, <kbd>Shift</kbd>+<kbd>PgUp</kbd> / <kbd>PgDn</kbd> / <kbd>Home</kbd> / <kbd>End</kbd> |
 | Select while an app uses the mouse | hold <kbd>Shift</kbd> |
 | Reconnect after the shell exits | <kbd>Enter</kbd> |
+| Switch workspace | click the workspace name in the header (middle-click an entry to open it in a new tab) |
 
 ## Features
 
