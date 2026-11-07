@@ -1,0 +1,42 @@
+# Local development: one workspace for the project you're working on, opened
+# directly in the browser. No gateway: the workspace serves its own terminal.
+#
+#   just local ~/code/myapp [base] [port]      (from the repo; see `just --list`)
+#
+# or with compose directly:
+#
+#   cd examples/local
+#   PROJECT_DIR=~/code/myapp docker compose up -d --build
+#   open http://localhost:8080
+#
+# One compose project per code project: each gets its own home volume (plugins,
+# history, tmux sessions) and its own port.
+#
+#   PROJECT_DIR=~/code/api PORT=8081 WORKSPACE_BASE=python:3-trixie docker compose -p webterm-local-api up -d --build
+name: webterm-local
+
+services:
+  workspace:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile
+      target: workspace
+      args:
+        # Any apt-based image with your toolchain: golang, python, rust, node, ...
+        WORKSPACE_BASE: ${WORKSPACE_BASE:-golang:1-trixie}
+    hostname: dev
+    init: true
+    restart: unless-stopped
+    ports:
+      # Localhost only: a connection is a shell in the workspace.
+      - "127.0.0.1:${PORT:-8080}:8080"
+    environment:
+      # 1: tabs attach to a persistent tmux session; 0: a plain fish shell per tab.
+      WORKSPACE_TMUX: ${WORKSPACE_TMUX:-1}
+    volumes:
+      - home:/home/dev
+      # The folder you work on (default: the repo's ./workspace).
+      - ${PROJECT_DIR:-../../workspace}:/home/dev/workspace
+
+volumes:
+  home:

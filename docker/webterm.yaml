@@ -1,22 +1,21 @@
-# Workspaces the browser terminal can attach to, in the order the side panel
-# lists them; the first is opened when the URL doesn't name one. With a single
-# workspace the page shows only the terminal, without the header.
+# Workspaces the gateway offers, in the order the side panel lists them; the
+# first is opened when the URL doesn't name one. With a single workspace the
+# page shows only the terminal, without the header.
 #
-# Each workspace either attaches to a tmux server (`tmux_socket`, and
-# optionally `tmux_session`, default "main") or runs a `command`:
+# Each workspace either relays to a term-server (`url`, a workspace service in
+# compose.yaml: ws://<service>:8080/ws) or runs a `command` in the gateway
+# itself (which is distroless, so only for custom gateway images):
 #
 #   - name: shell
 #     command: [/bin/sh, -l]
 #
-# A tmux workspace must match a service in compose.yaml: its socket is
-# /run/tmux/<WORKSPACE_NAME>. Restart the sidecar after editing this file
-# (`docker compose restart terminal`).
+# Restart the gateway after editing this file (`docker compose restart gateway`).
 
 workspaces:
   - name: go
     description: Go · golang:1-trixie
-    tmux_socket: /run/tmux/go
+    url: ws://go:8080/ws
 
   - name: python
     description: Python · python:3-trixie
-    tmux_socket: /run/tmux/python
+    url: ws://python:8080/ws

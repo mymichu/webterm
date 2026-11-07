@@ -5,11 +5,104 @@ browser tab. Each **workspace** is a container with a language toolchain (Go,
 Python, Rust, ...) plus the same editor setup: tmux, fish, starship, Neovim with
 LazyVim, lazygit, fzf, ripgrep and fd.
 
+- [Two ways to run it](#two-ways-to-run-it)
 - [Getting started](#getting-started)
 - [Everyday use](#everyday-use)
 - [Workspace scenarios](#workspace-scenarios)
 - [How it fits together](#how-it-fits-together)
 - [Troubleshooting](#troubleshooting)
+
+## Two ways to run it
+
+Every workspace serves its own browser terminal. The **gateway** is an
+optional extra that puts several workspaces behind one URL. Which setup fits
+depends on where it runs:
+
+| | **Local development** | **Server** |
+|---|---|---|
+| Example | [`examples/local`](../examples/local) | [`examples/server`](../examples/server) |
+| Gateway | no: open the workspace directly | yes, behind Caddy for HTTPS |
+| Workspaces | one per project, each its own compose project and port | as many as you like, one URL, switched in the header |
+| Code | your project folder, bind-mounted from your machine | a volume on the server, shared by the workspaces |
+| Reachable from | `127.0.0.1` only | the internet (or your VPN), over HTTPS |
+| Auth | none needed | `TERM_TOKEN` for browsers, `WORKSPACE_TOKEN` between gateway and workspaces |
+| Resources | whatever Docker has | CPU and memory limits per workspace |
+
+The [`compose.yaml`](../compose.yaml) at the top of the repo sits in between:
+it runs the server layout (gateway with Go and Python) on localhost without
+TLS, so you can try everything with one `just up`. The
+[getting started](#getting-started) steps below use it.
+
+### Local development: one workspace per project
+
+You work on a project on your laptop and want its toolchain and editor setup in
+a container, without installing anything. Start a workspace for it and open it
+directly; there's no gateway to configure.
+
+```sh
+just local ~/code/myapp                    # → http://localhost:8080
+```
+
+The project folder is mounted as `~/workspace`, so your files stay on your
+machine and your host editor and git see the same files. The optional second
+and third arguments pick the toolchain (any apt-based image) and the port, so
+several projects can run side by side:
+
+```sh
+just local ~/code/api python:3-trixie 8081   # → http://localhost:8081
+just local-ls                                # list running project workspaces
+just local-down ~/code/api                   # stop it (its home volume is kept)
+```
+
+Each project gets its own compose project, named after its folder
+(`webterm-local-api`), and so its own home volume with plugins, history and
+the tmux session. Starting it again later picks all of that up.
+
+<details>
+<summary>Without just</summary>
+
+```sh
+PROJECT_DIR=~/code/api WORKSPACE_BASE=python:3-trixie PORT=8081 \
+  docker compose -f examples/local/compose.yaml -p webterm-local-api up -d --build
+docker compose -f examples/local/compose.yaml -p webterm-local-api down
+```
+
+</details>
+
+### Server: many workspaces behind one URL
+
+You run webterm on a server, a cloud VM or a home lab box, for yourself from
+anywhere or for a team. Only HTTPS is exposed; the workspaces are reachable
+only through the gateway.
+
+```
+internet ──https──▶ caddy ──▶ gateway ──▶ go:8080, python:8080, ...
+                    (TLS)     (token)     (WORKSPACE_TOKEN, no published ports)
+```
+
+```sh
+cp examples/server/.env.example examples/server/.env
+$EDITOR examples/server/.env     # DOMAIN, TERM_TOKEN, WORKSPACE_TOKEN (openssl rand -hex 32)
+just server                      # → https://$DOMAIN/?token=$TERM_TOKEN
+just server-logs gateway         # follow the logs (all services without an argument)
+just server-down                 # stop (code, homes and certificates are kept)
+```
+
+Without just, run `docker compose up -d --build` (or `logs -f`, `down`) in
+`examples/server`.
+
+- The DNS record for `DOMAIN` must point at the server, with ports 80 and 443
+  open, so Caddy can get a Let's Encrypt certificate.
+- Caddy only reaches the gateway, and only the gateway reaches the workspaces
+  (two Docker networks). Every workspace has CPU and memory limits, so one
+  busy build doesn't slow down the others.
+- The code lives in the `code` volume on the server; clone your repositories
+  into `~/workspace` from any workspace.
+- Workspaces are added the same way as below: a service in `compose.yaml` and
+  an entry in `webterm.yaml`.
+- The token in the URL is the only login. For a team, put real
+  authentication in front, e.g. Caddy's `forward_auth` with an identity
+  provider, or keep the server on a VPN like Tailscale or WireGuard.
 
 ## Getting started
 
@@ -38,15 +131,15 @@ cd webterm
 just up                   # or: docker compose up -d --build --remove-orphans
 ```
 
-The first run builds three images (`go`, `python` and the `terminal` sidecar),
-which takes a few minutes. Each workspace then installs its Neovim plugins once,
+The first run builds three images (`go`, `python` and the `gateway`), which
+takes a few minutes. Each workspace then installs its Neovim plugins once,
 which takes about a minute. Follow along with:
 
 ```sh
 docker compose logs -f go python
 ```
 
-A workspace is ready when its log shows `workspace: tmux server on /run/tmux/<name>`
+A workspace is ready when its log shows `workspace: terminal on 0.0.0.0:8080`
 and `docker compose ps` lists it as `healthy`.
 
 ### 3. Open
@@ -73,13 +166,27 @@ tools, shell history and tmux-resurrect saves live in volumes, and your code in
 
 ### Commands
 
+The [`justfile`](../justfile) has a recipe for each setup (`just --list` shows
+them all):
+
+| recipe | setup | what it does |
+|---|---|---|
+| `just up` | demo | build if needed, then start the gateway with Go and Python on :8080 |
+| `just down` | demo | stop it (data is kept) |
+| `just local <dir> [base] [port]` | local | start a workspace for a project folder, default `golang:1-trixie` on :8080 |
+| `just local-down <dir>` | local | stop that project's workspace (its home volume is kept) |
+| `just local-ls` | local | list the running project workspaces |
+| `just server` | server | start Caddy, the gateway and the workspaces (needs `examples/server/.env`) |
+| `just server-logs [service]` | server | follow the logs, of all services or one |
+| `just server-down` | server | stop it (code, homes and certificates are kept) |
+
+For the demo, plain `docker compose` works from the repo folder:
+
 | command | what it does |
 |---|---|
-| `just up` | build if needed, then start everything |
-| `just down` | stop everything (data is kept) |
 | `docker compose ps` | status of each container |
 | `docker compose logs -f go` | follow a workspace's log |
-| `docker compose restart terminal` | reload `docker/webterm.yaml` |
+| `docker compose restart gateway` | reload `docker/webterm.yaml` |
 | `docker compose up -d --build go` | rebuild one workspace after changing its config |
 | `docker compose exec go fish` | a shell in a workspace without the browser |
 
@@ -98,7 +205,8 @@ tools, shell history and tmux-resurrect saves live in volumes, and your code in
 
 All tabs on the same workspace share its tmux session, so a second tab (or a
 second computer) shows the same windows. Closing the tab doesn't stop anything;
-the session keeps running in the container.
+the session keeps running in the container. (Without tmux, see
+[below](#without-tmux), each tab is its own shell.)
 
 ### Settings
 
@@ -107,13 +215,19 @@ to `.gitignore` first if it holds a token):
 
 | variable | default | meaning |
 |---|---|---|
-| `PORT` | `8080` | port on `127.0.0.1` the page is served on |
+| `PORT` | `8080` | port on `127.0.0.1` the gateway is served on |
 | `WORKSPACE_DIR` | `./workspace` | host folder mounted as `~/workspace` in every workspace |
+| `WORKSPACE_TMUX` | `1` | `1`: tabs attach to a persistent tmux session; `0`: a plain fish shell per tab |
 | `TERM_TOKEN` | unset | require `http://localhost:8080/?token=<value>` |
+| `WORKSPACE_TOKEN` | unset | shared secret between the gateway and the workspaces |
 
 The port is only reachable from your own machine. If you expose it on a network,
 set `TERM_TOKEN` (e.g. `TERM_TOKEN=$(openssl rand -hex 16) just up`) and put it
 behind TLS: anyone who can connect gets a shell in your workspaces.
+
+The workspaces' own port 8080 is only reachable on the compose network, so by
+default any container on it could open a shell in them. To lock that down, set
+`WORKSPACE_TOKEN` as well: the gateway sends it, and the workspaces require it.
 
 ## Workspace scenarios
 
@@ -122,7 +236,7 @@ Two files describe the workspaces, and they have to agree:
 - **[`compose.yaml`](../compose.yaml)** has one service per workspace: which base
   image it's built from and where its data lives.
 - **[`docker/webterm.yaml`](../docker/webterm.yaml)** lists the workspaces the
-  browser can open, in the order the side panel shows them. The first one is the
+  gateway offers, in the order the side panel shows them. The first one is the
   default.
 
 ### Go and Python (the default)
@@ -133,27 +247,45 @@ workspace's Mason tools (gopls, ...) and the Python workspace's (pyright, ruff,
 ...) don't mix. LazyVim turns on its Go, Python or Rust support when that
 toolchain is installed.
 
-### A single workspace: just the terminal
+### A single workspace, without the gateway
 
-When `docker/webterm.yaml` lists only one workspace, there's nothing to choose:
-the page is just the terminal, full screen, with no header.
+Every workspace serves its own terminal, so with just one you don't need the
+gateway: publish the workspace's port and open it directly. The page is just
+the terminal, full screen, with no header.
 
 To keep only Go:
 
-1. In `docker/webterm.yaml`, delete the `python` entry:
+1. In `compose.yaml`, delete the `python` and `gateway` services and the
+   `home-python` volume, and publish Go's port:
 
    ```yaml
-   workspaces:
-     - name: go
-       description: Go · golang:1-trixie
-       tmux_socket: /run/tmux/go
+     go:
+       # ...
+       ports:
+         - "127.0.0.1:8080:8080"
    ```
 
-2. In `compose.yaml`, delete the `python` service and the `home-python` volume.
-3. Run `just up`. The `--remove-orphans` flag removes the old `python` container.
+2. Run `just up` and open <http://localhost:8080>. The `--remove-orphans` flag
+   removes the old containers.
 
 The `home-python` volume stays on disk until you delete it
 (`docker volume rm webterm_home-python`).
+
+You can also keep the gateway and publish a workspace next to it, e.g.
+`127.0.0.1:8081:8080` (commented out in `compose.yaml`), to open that workspace
+both ways.
+
+### Without tmux
+
+tmux is optional. With `WORKSPACE_TMUX=0`, each tab gets its own fish shell in
+`~/workspace`, which ends when the tab closes:
+
+```sh
+WORKSPACE_TMUX=0 just up
+```
+
+To change it for one workspace only, set `WORKSPACE_TMUX: 0` in that service's
+`environment` in `compose.yaml`.
 
 ### Adding a workspace (Rust example)
 
@@ -170,11 +302,8 @@ The `home-python` volume stays on disk until you delete it
          args:
            WORKSPACE_BASE: rust:1-trixie
        hostname: rust
-       environment:
-         WORKSPACE_NAME: rust
        volumes:
          - home-rust:/home/dev
-         - tmux-socket:/run/tmux
          - ${WORKSPACE_DIR:-./workspace}:/home/dev/workspace
    ```
 
@@ -185,24 +314,22 @@ The `home-python` volume stays on disk until you delete it
      home-rust:
    ```
 
-2. In `docker/webterm.yaml`, add the entry. `tmux_socket` is always
-   `/run/tmux/<WORKSPACE_NAME>`:
+2. In `docker/webterm.yaml`, add the entry. The URL uses the service name:
 
    ```yaml
      - name: rust
        description: Rust · rust:1-trixie
-       tmux_socket: /run/tmux/rust
+       url: ws://rust:8080/ws
    ```
 
 3. Run `just up`. The new workspace appears in the side panel once its first start
    is done.
 
-**Which base images work:** any image based on **Debian trixie**, e.g.
-`golang:1-trixie`, `python:3-trixie`, `rust:1-trixie`, `node:24-trixie` or
-`buildpack-deps:trixie` for a general-purpose one. Other distributions, and other
-Debian releases like bookworm, don't work: the sidecar's tmux client has to be
-the exact same version as each workspace's tmux server, and both come from
-Debian trixie.
+**Which base images work:** any image with `apt`, i.e. based on Debian or
+Ubuntu, e.g. `golang:1-trixie`, `python:3-trixie`, `rust:1-trixie`,
+`node:24-trixie` or `buildpack-deps:trixie` for a general-purpose one. The
+workspace's term-server is a static binary and doesn't care about the distro;
+only the package installation in `docker/Dockerfile` uses `apt`.
 
 ### Removing or resetting a workspace
 
@@ -231,46 +358,53 @@ Edit them and run `just up` to rebuild:
 | `config.fish` | fish: aliases, fzf keys, starship prompt |
 | `starship.toml` | the prompt |
 | `nvim/init.lua` | LazyVim and its language extras |
+| `entrypoint.sh` | what a tab runs (tmux or fish) |
 
-The tool versions (Neovim, lazygit, starship) are set as `ARG`s at the top of the
-`devtools` stage in [`docker/Dockerfile`](../docker/Dockerfile).
+The tool versions (Neovim, lazygit, starship, fzf) are set as `ARG`s at the top
+of the `devtools` stage in [`docker/Dockerfile`](../docker/Dockerfile).
 
 ## How it fits together
 
 ```
- browser ──▶ terminal (sidecar) ── tmux attach ──▶ /run/tmux/go      ◀── go workspace
-             term-server                           /run/tmux/python  ◀── python workspace
-             reads docker/webterm.yaml                (shared volume)
+ browser ──▶ gateway :8080 ──▶ go:8080      term-server → tmux session "main" (or fish)
+             term-server       python:8080  term-server → tmux session "main" (or fish)
+             docker/webterm.yaml
 ```
 
-- Every **workspace** runs a tmux server, with its socket in a volume shared with
-  the sidecar. Your shells, editors and programs all run in the workspace.
-- The **terminal** sidecar serves the page. When you open a workspace, it runs
-  `tmux attach` against that workspace's socket and streams the terminal over a
-  WebSocket. It's a small distroless image with no shell. No SSH, Docker socket
-  or extra privileges are involved.
+- Every **workspace** runs `term-server` on port 8080. A connection gets a
+  terminal running `tmux new-session -A -s main` (or `fish -l`), so your
+  shells, editors and programs all run in the workspace.
+- The **gateway** is the same `term-server`, configured with the workspaces'
+  URLs. It serves the page and the workspace list, and relays each tab's
+  WebSocket to the chosen workspace without looking at the bytes. It's a 12 MB
+  distroless image with no shell. No SSH, Docker socket or extra privileges are
+  involved.
 - The workspace images are built in layers: the language base image, then one
-  shared **devtools** layer (Neovim, LazyVim config, lazygit, starship, tmux
-  plugins) that doesn't depend on the base. Docker stores it once for all
-  workspaces.
+  shared **devtools** layer (term-server, Neovim, LazyVim config, lazygit, fzf,
+  starship, tmux plugins) that doesn't depend on the base. Docker stores it
+  once for all workspaces.
 
 ## Troubleshooting
 
 **`Cannot connect to the Docker daemon` with Colima, although `colima start` says
 it's running.** The socket forwarding is stuck. Run `colima restart`.
 
-**A workspace is marked as stopped, or the page shows a tmux error such as
-`no server running` or `Connection refused`.**
-Check `docker compose ps` and `docker compose logs <name>`. On the first start,
-the workspace only starts tmux after its Neovim plugins are installed.
+**A workspace is marked as stopped, or the page says
+`workspace <name> is unreachable`.** Check `docker compose ps` and
+`docker compose logs <name>`. On the first start, the workspace only starts its
+terminal after its Neovim plugins are installed.
+
+**The page says `invalid token` or the workspace is unreachable with a 401.**
+`WORKSPACE_TOKEN` has to be the same for the gateway and the workspaces; run
+`just up` after changing it so all containers pick it up.
 
 **The side panel doesn't show a workspace I added.** It has to be in
 `docker/webterm.yaml` as well as in `compose.yaml`. Run
-`docker compose restart terminal` after editing `docker/webterm.yaml`.
+`docker compose restart gateway` after editing `docker/webterm.yaml`.
 
-**The `terminal` container keeps restarting.** `docker/webterm.yaml` is probably
-invalid; `docker compose logs terminal` names the problem, such as a duplicate
-name, an unknown key, or an entry with neither `tmux_socket` nor `command`.
+**The `gateway` container keeps restarting.** `docker/webterm.yaml` is probably
+invalid; `docker compose logs gateway` names the problem, such as a duplicate
+name, an unknown key, or an entry with neither `url` nor `command`.
 
 **Neovim shows errors on first open.** The plugin install may still be running in
 the background, or have been cut short. Run `:Lazy sync` in Neovim.

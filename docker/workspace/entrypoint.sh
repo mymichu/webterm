@@ -1,16 +1,11 @@
 #!/bin/sh
-# Runs the tmux server that the terminal sidecar attaches to, and keeps a
-# "main" session alive so there is always something to attach to.
+# Serves this workspace's browser terminal on $BIND (:8080): open it directly
+# by publishing the port, or through the gateway (see docker/webterm.yaml).
 #
-# Each workspace container has its own socket, /run/tmux/$WORKSPACE_NAME, in
-# the volume shared with the sidecar (see docker/webterm.yaml).
+# WORKSPACE_TMUX=1 (default): every tab attaches to the tmux session "main",
+# which keeps running when the tab closes and is shared by all tabs.
+# WORKSPACE_TMUX=0: every tab gets its own fish shell, ended with the tab.
 set -eu
-
-NAME="${WORKSPACE_NAME:-$(hostname)}"
-SOCKET_DIR="${TMUX_SOCKET_DIR:-/run/tmux}"
-SOCKET="$SOCKET_DIR/$NAME"
-SESSION="${TMUX_SESSION:-main}"
-tmux_() { tmux -u -S "$SOCKET" -f /opt/devtools/etc/tmux.conf "$@"; }
 
 # The nvim config ships in the image; the home directory is a volume, so copy
 # it in on every start to pick up image updates (lazy-lock.json is kept).
@@ -26,9 +21,11 @@ if [ ! -d "$HOME/.local/share/nvim/lazy/LazyVim" ]; then
         || echo "workspace: plugin install incomplete; nvim will finish it on first launch"
 fi
 
-echo "workspace: tmux server on $SOCKET"
-while true; do
-    tmux_ has-session -t "$SESSION" 2>/dev/null \
-        || tmux_ new-session -d -s "$SESSION" -c "$HOME/workspace"
-    sleep 2
-done
+export TERM_CWD="$HOME/workspace"
+if [ "${WORKSPACE_TMUX:-1}" = 1 ]; then
+    export TERM_SHELL=tmux TERM_ARGS="-u -f /opt/devtools/etc/tmux.conf new-session -A -s main"
+else
+    export TERM_SHELL=fish TERM_ARGS=-l
+fi
+echo "workspace: terminal on $BIND ($TERM_SHELL)"
+exec term-server

@@ -1,0 +1,5 @@
+# HTTPS for $DOMAIN with an automatic certificate; WebSockets are proxied as is.
+{$DOMAIN} {
+	encode zstd gzip
+	reverse_proxy gateway:8080
+}

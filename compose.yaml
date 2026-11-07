@@ -1,27 +1,32 @@
 # Browser terminal for containerized dev environments.
 #
 #   go, python  Workspaces: a language base image plus the shared devtools
-#               layer (tmux, fish, LazyVim, git, ...; see docker/Dockerfile).
-#               Each runs its own tmux server on /run/tmux/<name>.
-#   terminal    Sidecar: serves the WebAssembly terminal and attaches each
-#               browser tab to a workspace's tmux session through the shared
-#               socket volume. docker/webterm.yaml lists the workspaces; with
-#               more than one, the header in the page switches between them.
+#               layer (term-server, tmux, fish, LazyVim, git, ...; see
+#               docker/Dockerfile). Each serves its own terminal on :8080,
+#               reachable only on the compose network unless you publish it.
+#   gateway     One URL for all of them: serves the page and relays each
+#               browser tab to the workspace picked in the header.
+#               docker/webterm.yaml lists the workspaces.
 #
 #   just up   →   http://localhost:8080
 #
 # To add a workspace, copy a service below and change its name, WORKSPACE_BASE
-# (any Debian trixie image, e.g. rust:1-trixie or node:24-trixie) and volume,
-# then add it to docker/webterm.yaml.
+# (an apt-based image, e.g. rust:1-trixie or node:24-trixie) and volume, then
+# add it to docker/webterm.yaml.
 name: webterm
 
 x-workspace: &workspace
   init: true
   restart: unless-stopped
+  environment:
+    # 1: tabs attach to a persistent tmux session; 0: a plain fish shell per tab.
+    WORKSPACE_TMUX: ${WORKSPACE_TMUX:-1}
+    # Shared secret between the gateway and the workspaces (optional).
+    TERM_TOKEN: ${WORKSPACE_TOKEN:-}
   healthcheck:
-    test: ["CMD-SHELL", "tmux -S /run/tmux/$$WORKSPACE_NAME has-session -t main"]
+    test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8080/"]
     interval: 5s
-    # The first start installs LazyVim plugins before tmux comes up.
+    # The first start installs LazyVim plugins before the terminal comes up.
     start_period: 15m
 
 services:
@@ -34,12 +39,12 @@ services:
       args:
         WORKSPACE_BASE: golang:1-trixie
     hostname: go
-    environment:
-      WORKSPACE_NAME: go
     volumes:
       - home-go:/home/dev
-      - tmux-socket:/run/tmux
       - ${WORKSPACE_DIR:-./workspace}:/home/dev/workspace
+    # Uncomment to also open this workspace directly, without the gateway:
+    # ports:
+    #   - "127.0.0.1:8081:8080"
 
   python:
     <<: *workspace
@@ -50,33 +55,28 @@ services:
       args:
         WORKSPACE_BASE: python:3-trixie
     hostname: python
-    environment:
-      WORKSPACE_NAME: python
     volumes:
       - home-python:/home/dev
-      - tmux-socket:/run/tmux
       - ${WORKSPACE_DIR:-./workspace}:/home/dev/workspace
 
-  terminal:
+  gateway:
     build:
       context: .
       dockerfile: docker/Dockerfile
-      target: terminal
-    init: true
+      target: gateway
     restart: unless-stopped
     ports:
       # Localhost only: a connection is a shell in a workspace.
       - "127.0.0.1:${PORT:-8080}:8080"
     volumes:
-      - tmux-socket:/run/tmux
       - ./docker/webterm.yaml:/etc/webterm/webterm.yaml:ro
     environment:
       # Set to require http://localhost:8080/?token=...
       TERM_TOKEN: ${TERM_TOKEN:-}
+      TERM_UPSTREAM_TOKEN: ${WORKSPACE_TOKEN:-}
 
 volumes:
   # One home per workspace: plugins, Mason tools, shell history and
   # tmux-resurrect saves persist across restarts.
   home-go:
   home-python:
-  tmux-socket:

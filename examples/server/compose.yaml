@@ -1,0 +1,106 @@
+# Server: several workspaces behind one HTTPS URL, for a team or a remote dev
+# box. Caddy terminates TLS (automatic Let's Encrypt certificates) and forwards
+# to the gateway, which relays each browser tab to the chosen workspace.
+#
+#   cp examples/server/.env.example examples/server/.env && just server
+#
+# or with compose directly:
+#
+#   cd examples/server
+#   cp .env.example .env        # set DOMAIN and the two tokens
+#   docker compose up -d --build
+#   open https://$DOMAIN/?token=$TERM_TOKEN
+#
+# Networks: Caddy only reaches the gateway; only the gateway reaches the
+# workspaces. Nothing but Caddy publishes a port.
+name: webterm-server
+
+x-workspace: &workspace
+  init: true
+  restart: always
+  environment:
+    WORKSPACE_TMUX: 1
+    # The workspaces only accept connections that carry this token, which the
+    # gateway sends (TERM_UPSTREAM_TOKEN).
+    TERM_TOKEN: ${WORKSPACE_TOKEN:?set WORKSPACE_TOKEN}
+  healthcheck:
+    test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8080/"]
+    interval: 10s
+    start_period: 15m
+  # Keep one busy workspace from starving the others.
+  deploy:
+    resources:
+      limits:
+        cpus: "2"
+        memory: 4g
+  networks: [workspaces]
+
+services:
+  caddy:
+    image: caddy:2
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN to the server's host name}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: [edge]
+
+  gateway:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile
+      target: gateway
+    restart: always
+    environment:
+      # Every browser connection needs ?token=... (the page passes it on).
+      TERM_TOKEN: ${TERM_TOKEN:?set TERM_TOKEN}
+      TERM_UPSTREAM_TOKEN: ${WORKSPACE_TOKEN:?set WORKSPACE_TOKEN}
+    volumes:
+      - ./webterm.yaml:/etc/webterm/webterm.yaml:ro
+    networks: [edge, workspaces]
+
+  go:
+    <<: *workspace
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile
+      target: workspace
+      args:
+        WORKSPACE_BASE: golang:1-trixie
+    hostname: go
+    volumes:
+      - home-go:/home/dev
+      - code:/home/dev/workspace
+
+  python:
+    <<: *workspace
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile
+      target: workspace
+      args:
+        WORKSPACE_BASE: python:3-trixie
+    hostname: python
+    volumes:
+      - home-python:/home/dev
+      - code:/home/dev/workspace
+
+networks:
+  edge:
+  # Not `internal: true`: workspaces need the internet for go get, pip, Mason, ...
+  workspaces:
+
+volumes:
+  # The code lives on the server, shared by all workspaces; clone into it from
+  # a workspace (git clone ... ~/workspace/<repo>).
+  code:
+  home-go:
+  home-python:
+  caddy-data:
+  caddy-config:

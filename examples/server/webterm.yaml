@@ -1,0 +1,10 @@
+# Workspaces offered by the gateway; the URL host is the compose service name.
+# Restart the gateway after editing: docker compose restart gateway
+workspaces:
+  - name: go
+    description: Go · golang:1-trixie
+    url: ws://go:8080/ws
+
+  - name: python
+    description: Python · python:3-trixie
+    url: ws://python:8080/ws

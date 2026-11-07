@@ -5,9 +5,9 @@
 //! workspaces:
 //!   - name: go
 //!     description: Go · golang:1-trixie
-//!     tmux_socket: /run/tmux/go   # attach to the tmux server on this socket
+//!     url: ws://go:8080/ws        # relay to the term-server running there
 //!   - name: shell
-//!     command: [fish, -l]         # or run any command
+//!     command: [fish, -l]         # or run a command here
 //! ```
 //!
 //! Without `TERM_CONFIG` there is a single workspace running `TERM_SHELL`
@@ -15,42 +15,40 @@
 //! than one is configured.
 
 use std::collections::HashSet;
-use std::os::unix::net::UnixStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
+use std::time::Duration;
 
+use axum::http::Uri;
 use serde::Deserialize;
+
+/// How long the liveness check waits for an upstream term-server.
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, PartialEq)]
 pub struct Workspace {
     pub name: String,
     pub description: String,
-    target: Target,
+    pub target: Target,
 }
 
 #[derive(Debug, PartialEq)]
-enum Target {
-    Tmux { socket: PathBuf, session: String },
+pub enum Target {
+    /// Run a program in a PTY on this host.
     Command { program: String, args: Vec<String> },
+    /// Relay the connection to another term-server (`ws://host:port/path`).
+    Url { url: String, host: String, port: u16 },
 }
 
 impl Workspace {
-    /// The program and arguments to run in a new PTY for this workspace.
-    pub fn command(&self) -> (String, Vec<String>) {
-        match &self.target {
-            Target::Tmux { socket, session } => (
-                "tmux".into(),
-                vec!["-u".into(), "-S".into(), socket.display().to_string(), "attach-session".into(), "-t".into(), session.clone()],
-            ),
-            Target::Command { program, args } => (program.clone(), args.clone()),
-        }
-    }
-
-    /// Whether the workspace can be attached to right now: its tmux server
-    /// accepts connections. Command workspaces are always available.
+    /// Whether the workspace can be connected to right now: its upstream
+    /// term-server accepts TCP connections. Command workspaces always can.
     pub fn running(&self) -> bool {
         match &self.target {
-            Target::Tmux { socket, .. } => UnixStream::connect(socket).is_ok(),
             Target::Command { .. } => true,
+            Target::Url { host, port, .. } => (host.as_str(), *port)
+                .to_socket_addrs()
+                .is_ok_and(|mut addrs| addrs.any(|addr| TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).is_ok())),
         }
     }
 }
@@ -68,8 +66,7 @@ struct Entry {
     name: String,
     #[serde(default)]
     description: String,
-    tmux_socket: Option<PathBuf>,
-    tmux_session: Option<String>,
+    url: Option<String>,
     command: Option<Vec<String>>,
 }
 
@@ -105,19 +102,29 @@ pub fn parse(text: &str) -> Result<Vec<Workspace>, String> {
             if !seen.insert(e.name.clone()) {
                 return Err(format!("workspace {:?} is configured twice", e.name));
             }
-            let target = match (e.tmux_socket, e.command) {
-                (Some(socket), None) => Target::Tmux { socket, session: e.tmux_session.unwrap_or_else(|| "main".into()) },
-                (None, Some(command)) if e.tmux_session.is_none() => {
+            let target = match (e.url, e.command) {
+                (Some(url), None) => parse_url(url).map_err(|err| format!("workspace {:?}: {err}", e.name))?,
+                (None, Some(command)) => {
                     let mut command = command.into_iter();
                     let program = command.next().ok_or_else(|| format!("workspace {:?}: command is empty", e.name))?;
                     Target::Command { program, args: command.collect() }
                 }
-                (None, Some(_)) => return Err(format!("workspace {:?}: tmux_session needs tmux_socket", e.name)),
-                _ => return Err(format!("workspace {:?}: set either tmux_socket or command", e.name)),
+                _ => return Err(format!("workspace {:?}: set either url or command", e.name)),
             };
             Ok(Workspace { name: e.name, description: e.description, target })
         })
         .collect()
+}
+
+fn parse_url(url: String) -> Result<Target, String> {
+    let uri: Uri = url.parse().map_err(|_| format!("invalid url {url:?}"))?;
+    if uri.scheme_str() != Some("ws") {
+        return Err(format!("url {url:?} must start with ws://"));
+    }
+    let host = uri.host().filter(|h| !h.is_empty()).ok_or_else(|| format!("url {url:?} has no host"))?;
+    let host = host.trim_start_matches('[').trim_end_matches(']').to_string();
+    let port = uri.port_u16().unwrap_or(80);
+    Ok(Target::Url { url, host, port })
 }
 
 #[cfg(test)]
@@ -125,13 +132,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_tmux_and_command_workspaces() {
+    fn parses_url_and_command_workspaces() {
         let ws = parse(
             "
 workspaces:
   - name: go
     description: Go
-    tmux_socket: /run/tmux/go
+    url: ws://go:8080/ws
   - name: shell
     command: [fish, -l]
 ",
@@ -140,8 +147,8 @@ workspaces:
         assert_eq!(ws.len(), 2);
         assert_eq!(ws[0].name, "go");
         assert_eq!(ws[0].description, "Go");
-        assert_eq!(ws[0].command(), ("tmux".into(), ["-u", "-S", "/run/tmux/go", "attach-session", "-t", "main"].map(String::from).to_vec()));
-        assert_eq!(ws[1].command(), ("fish".into(), vec!["-l".into()]));
+        assert_eq!(ws[0].target, Target::Url { url: "ws://go:8080/ws".into(), host: "go".into(), port: 8080 });
+        assert_eq!(ws[1].target, Target::Command { program: "fish".into(), args: vec!["-l".into()] });
         assert!(ws[1].running());
     }
 
@@ -151,16 +158,20 @@ workspaces:
         assert!(err("workspaces: []").contains("no workspaces"));
         assert!(err("workspaces: [{name: ../x, command: [sh]}]").contains("may only contain"));
         assert!(err("workspaces: [{name: a, command: [sh]}, {name: a, command: [sh]}]").contains("twice"));
-        assert!(err("workspaces: [{name: a}]").contains("either tmux_socket or command"));
+        assert!(err("workspaces: [{name: a}]").contains("either url or command"));
+        assert!(err("workspaces: [{name: a, url: 'ws://x/ws', command: [sh]}]").contains("either url or command"));
         assert!(err("workspaces: [{name: a, command: []}]").contains("empty"));
-        assert!(err("workspaces: [{name: a, command: [sh], tmux_session: x}]").contains("needs tmux_socket"));
+        assert!(err("workspaces: [{name: a, url: 'http://x/ws'}]").contains("must start with ws://"));
+        assert!(err("workspaces: [{name: a, url: 'wss://x/ws'}]").contains("must start with ws://"));
         assert!(err("workspaces: [{name: a, command: [sh], colour: 1}]").contains("unknown field"));
+        assert!(err("workspaces: [{name: a, tmux_socket: /run/tmux/a}]").contains("unknown field"));
         assert!(err("workspace: []").contains("unknown field"));
     }
 
     #[test]
-    fn stopped_tmux_workspace_is_not_running() {
-        let ws = parse("workspaces: [{name: gone, tmux_socket: /nonexistent/webterm.sock}]").unwrap();
+    fn unreachable_url_workspace_is_not_running() {
+        // Port 9 (discard) on localhost: nothing listens there.
+        let ws = parse("workspaces: [{name: gone, url: 'ws://127.0.0.1:9/ws'}]").unwrap();
         assert!(!ws[0].running());
     }
 }

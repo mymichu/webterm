@@ -709,11 +709,13 @@ name = "server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "futures-util",
  "portable-pty",
  "protocol",
  "serde",
  "serde_yaml_ng",
  "tokio",
+ "tokio-tungstenite",
  "tower-http",
  "tracing",
  "tracing-subscriber",

@@ -27,12 +27,28 @@ This starts a `go` and a `python` workspace, as listed in
 [`docker/webterm.yaml`](docker/webterm.yaml). The header shows the workspace
 you're in; click it to open the side panel and switch. With only one workspace
 configured, the page is just the terminal. Each workspace keeps its
-own tmux session, and every tab on the same workspace shares it. The first
+own tmux session (optional), and every tab on the same workspace shares it. The first
 start installs the Neovim plugins, which takes about a minute
 (`docker compose logs -f go python`).
 
-**→ [Docker workspaces guide](docs/docker.md)**: getting started step by step,
-everyday commands, and scenarios like a single workspace or adding a Rust one.
+Two ready-made setups in [`examples/`](examples):
+
+- **[Local development](examples/local)**: one workspace per project, your
+  project folder mounted in, opened directly on `localhost` (no gateway).
+  ```sh
+  just local ~/code/myapp                     # Go workspace → http://localhost:8080
+  just local ~/code/api python:3-trixie 8081  # another project, base and port
+  just local-down ~/code/api
+  ```
+- **[Server](examples/server)**: several workspaces behind one HTTPS URL, with
+  Caddy for TLS, tokens, and CPU/memory limits per workspace.
+  ```sh
+  cp examples/server/.env.example examples/server/.env   # domain + tokens
+  just server                                            # → https://<domain>/?token=...
+  ```
+
+**→ [Docker workspaces guide](docs/docker.md)**: both setups explained, getting
+started step by step, everyday commands, and scenarios like adding a Rust workspace.
 
 ### Native: your own shell
 
@@ -77,35 +93,38 @@ between a WebSocket and a PTY, with one shell per connection.
 ### The Docker setup
 
 ```
- browser ──ws──▶ terminal (sidecar)  ── tmux attach ──▶  /run/tmux/go      ◀── go workspace
-                 term-server + tmux client               /run/tmux/python  ◀── python workspace
+ browser ──ws──▶ gateway (term-server) ──ws──▶ go:8080      term-server → tmux or fish
+                 relays, runs nothing        python:8080  term-server → tmux or fish
 ```
 
 `compose.yaml` runs these containers, all built from [`docker/Dockerfile`](docker/Dockerfile):
 
 - **Workspaces** (`go`, `python`): a language base image (`golang:1-trixie`,
-  `python:3-trixie`) plus the shared **devtools** layer: Neovim + LazyVim,
-  lazygit, starship, the tmux plugins and their config, all under
-  `/opt/devtools`. The devtools layer doesn't depend on the base, so BuildKit
-  adds it to every workspace as the same layer (`COPY --link`). Each workspace
-  runs its own tmux server on `/run/tmux/<name>` and has its own home volume.
-  Your code lives in `./workspace`, shared by all of them (override with
+  `python:3-trixie`) plus the shared **devtools** layer: a static
+  `term-server` with the web files, Neovim + LazyVim, lazygit, fzf, starship,
+  the tmux plugins and their config, all under `/opt/devtools`. The devtools
+  layer doesn't depend on the base, so BuildKit adds it to every workspace as
+  the same layer (`COPY --link`). Each workspace serves its own terminal on
+  port 8080: every tab attaches to the tmux session `main`, or with
+  `WORKSPACE_TMUX=0` gets a plain fish shell. Each has its own home volume;
+  your code lives in `./workspace`, shared by all of them (override with
   `WORKSPACE_DIR`). LazyVim turns on the Go/Python/Rust extras when that
   toolchain is installed.
-- **terminal**: a sidecar that runs `term-server` with the workspaces from
-  `docker/webterm.yaml`. Each browser tab runs `tmux attach` against the chosen one,
-  so every process runs in the workspace. The image is distroless (~15 MB
-  download). No sshd, Docker socket or extra privileges are involved.
+- **gateway**: the same `term-server`, configured with the workspaces'
+  URLs in `docker/webterm.yaml`. It serves the page and relays each tab to the
+  chosen workspace, so every process runs in the workspace. The image is
+  distroless and static (12 MB). No sshd, Docker socket or extra privileges
+  are involved.
+
+The gateway is optional: publish a workspace's port and open it directly.
 
 The tmux (prefix `C-b`), LazyVim, fish and starship config lives in
 [`docker/workspace/`](docker/workspace). Edit it there and rerun `just up`.
 
 **Adding a workspace:** copy the `python` service in `compose.yaml`, then change
 its name, `WORKSPACE_BASE` and home volume, and add an entry to
-`docker/webterm.yaml`. Any Debian trixie based image works,
-e.g. `rust:1-trixie` or `node:24-trixie`. It has to be trixie because tmux comes
-from Debian, and the sidecar's tmux client must match each workspace's tmux
-server version.
+`docker/webterm.yaml`. Any apt-based (Debian or Ubuntu) image works,
+e.g. `rust:1-trixie` or `node:24-trixie`.
 
 ## Configuration
 
@@ -117,7 +136,9 @@ server version.
 | `TERM_CONFIG` | unset | workspace config file (see below) |
 | `TERM_SHELL` | `$SHELL` | without `TERM_CONFIG`: program to run for each connection |
 | `TERM_ARGS` | `-l` | its arguments (whitespace-separated) |
+| `TERM_CWD` | `$HOME` | working directory of that program |
 | `TERM_TOKEN` | unset | if set, connections need `?token=...` |
+| `TERM_UPSTREAM_TOKEN` | unset | token sent to the term-servers behind `url` workspaces |
 | `ALLOWED_ORIGINS` | unset | extra comma-separated origins allowed to connect |
 | `STATIC_DIR` | `web/` | front-end directory |
 
@@ -130,17 +151,18 @@ just the terminal.
 workspaces:
   - name: go
     description: Go · golang:1-trixie   # optional, shown in the header
-    tmux_socket: /run/tmux/go           # attach to the tmux server on this socket
-    # tmux_session: main                # default
+    url: ws://go:8080/ws                # relay to the term-server there
 
   - name: shell
-    command: [fish, -l]                 # or run any command
+    command: [fish, -l]                 # or run a command on this host
 ```
 
 Without `TERM_CONFIG` there's one workspace running `TERM_SHELL` `TERM_ARGS`.
-`GET /api/workspaces` lists the workspaces and whether each tmux server is up.
+`GET /api/workspaces` lists the workspaces and whether each one is reachable.
 
-Docker also reads `PORT` (default `8080`), `WORKSPACE_DIR` and `TERM_TOKEN`.
+Docker also reads `PORT` (default `8080`), `WORKSPACE_DIR`, `WORKSPACE_TMUX`
+(default `1`), `TERM_TOKEN` and `WORKSPACE_TOKEN` (shared by the gateway and
+the workspaces).
 
 **Front end** (query string): `http://localhost:8080/?workspace=python&fontSize=15&font=Fira+Code&token=...`
 
@@ -192,7 +214,11 @@ dropped), kitty keyboard/graphics protocols, configurable themes.
 just build                 # release build (web/pkg + target/release/term-server)
 just profile=debug build   # debug build
 just test                  # unit tests (cargo test --workspace)
+just run                   # build, then serve your own shell on http://127.0.0.1:8080
 ```
+
+`just --list` shows every recipe, including the Docker ones (`up`, `local`,
+`server`, ...) described in the [Docker guide](docs/docker.md#commands).
 
 Front-end changes only need `just build` and a page reload, because the server
 reads `web/` from disk on every request. If `wasm-opt` is installed, the build
